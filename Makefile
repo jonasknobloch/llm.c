@@ -17,7 +17,7 @@ FORCE_NVCC_O ?= 3
 # NVCC flags
 # -t=0 is short for --threads, 0 = number of CPUs on the machine
 NVCC_FLAGS = --threads=0 -t=0 --use_fast_math -std=c++17 -O$(FORCE_NVCC_O)
-NVCC_LDFLAGS = -lcublas -lcublasLt
+NVCC_LDFLAGS = -lcublas -lcublasLt -lnvrtc -lcuda
 NVCC_INCLUDES =
 NVCC_LDLIBS =
 NCLL_INCUDES =
@@ -199,10 +199,21 @@ ifeq ($(NO_MULTI_GPU), 1)
   $(info → Multi-GPU (NCCL) is manually disabled)
 else
   ifneq ($(OS), Windows_NT)
+#    # Check for NCCL via dpkg OR check if a module is loaded/path exists
+#    ifneq ($(shell dpkg -l | grep -q nccl && echo "exists" || echo "notfound"), notfound)
+#      NCCL_FOUND = 1
+#    else ifneq ($(LD_LIBRARY_PATH),)
+#      # If NCCL is in the library path (typical for modules), assume it's there
+#      ifeq ($(shell echo $(LD_LIBRARY_PATH) | grep -qi nccl && echo "exists"), exists)
+#        NCCL_FOUND = 1
+#      endif
+#    endif
+#
+#    ifeq ($(NCCL_FOUND), 1)
     # Detect if running on macOS or Linux
     ifeq ($(SHELL_UNAME), Darwin)
       $(info ✗ Multi-GPU on CUDA on Darwin is not supported, skipping NCCL support)
-    else ifeq ($(shell dpkg -l | grep -q nccl && echo "exists"), exists)
+    else ifeq ($(shell echo $(LD_LIBRARY_PATH) | grep -qi nccl && echo "exists"), exists)
       $(info ✓ NCCL found, OK to train with multiple GPUs)
       NVCC_FLAGS += -DMULTI_GPU
       NVCC_LDLIBS += -lnccl
@@ -214,7 +225,12 @@ else
 endif
 
 # Attempt to find and include OpenMPI on the system
-OPENMPI_DIR ?= /usr/lib/x86_64-linux-gnu/openmpi
+# Use MPI_HOME if set by a module (e.g. nvhpc/hpcx), otherwise fall back to the default system path
+ifdef MPI_HOME
+  OPENMPI_DIR ?= $(MPI_HOME)
+else
+  OPENMPI_DIR ?= /usr/lib/x86_64-linux-gnu/openmpi
+endif
 OPENMPI_LIB_PATH = $(OPENMPI_DIR)/lib/
 OPENMPI_INCLUDE_PATH = $(OPENMPI_DIR)/include/
 ifeq ($(NO_USE_MPI), 1)
