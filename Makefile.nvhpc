@@ -1,0 +1,140 @@
+CC ?= gcc
+CFLAGS = -Ofast -march=native -Wno-unused-result -Wno-ignored-pragmas -Wno-unknown-attributes
+LDFLAGS =
+LDLIBS = -lm
+INCLUDES =
+
+# Default O3 CPU optimization level for NVCC (0 for fastest compile time)
+FORCE_NVCC_O ?= 3
+
+# NVCC flags
+NVCC_FLAGS = --threads=0 -t=0 --use_fast_math -std=c++17 -O$(FORCE_NVCC_O)
+NVCC_LDFLAGS = -lcublas -lcublasLt -lnvrtc -lcuda -lnvidia-ml
+NVCC_INCLUDES =
+NVCC_LDLIBS =
+NVCC_CUDNN =
+
+BUILD_DIR = build
+$(shell mkdir -p $(BUILD_DIR))
+
+# Precision settings, default to bf16
+PRECISION ?= BF16
+VALID_PRECISIONS := FP32 FP16 BF16
+ifeq ($(filter $(PRECISION),$(VALID_PRECISIONS)),)
+  $(error Invalid precision $(PRECISION), valid precisions are $(VALID_PRECISIONS))
+endif
+ifeq ($(PRECISION), FP32)
+  PFLAGS = -DENABLE_FP32
+else ifeq ($(PRECISION), FP16)
+  PFLAGS = -DENABLE_FP16
+else
+  PFLAGS = -DENABLE_BF16
+endif
+
+# GPU compute capability autodetection
+ifndef GPU_COMPUTE_CAPABILITY
+  GPU_COMPUTE_CAPABILITY := $(strip $(shell nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | sed 's/\.//g' | sort -n | head -n 1))
+endif
+ifneq ($(GPU_COMPUTE_CAPABILITY),)
+  NVCC_FLAGS += --generate-code arch=compute_$(GPU_COMPUTE_CAPABILITY),code=[compute_$(GPU_COMPUTE_CAPABILITY),sm_$(GPU_COMPUTE_CAPABILITY)]
+endif
+
+$(info -------------------------------------------)
+
+# OpenMP
+ifeq ($(NO_OMP), 1)
+  $(info → OpenMP manually disabled)
+else ifeq ($(shell echo | $(CC) -fopenmp -x c -E - > /dev/null 2>&1; echo $$?), 0)
+  CFLAGS += -fopenmp -DOMP
+  LDLIBS += -lgomp
+  $(info ✓ OpenMP found)
+else
+  $(info ✗ OpenMP not found)
+endif
+
+# NCCL (multi-GPU) — typically in LD_LIBRARY_PATH when loaded via module
+ifeq ($(NO_MULTI_GPU), 1)
+  $(info → Multi-GPU (NCCL) manually disabled)
+else ifeq ($(shell echo $(LD_LIBRARY_PATH) | grep -qi nccl && echo "exists"), exists)
+  $(info ✓ NCCL found, OK to train with multiple GPUs)
+  NVCC_FLAGS += -DMULTI_GPU
+  NVCC_LDLIBS += -lnccl
+else
+  $(info ✗ NCCL not found, disabling multi-GPU support)
+endif
+
+# MPI — MPI_HOME is set by NVHPC/HPC-X module
+ifeq ($(NO_USE_MPI), 1)
+  $(info → MPI manually disabled)
+else ifneq ($(MPI_HOME),)
+  $(info ✓ MPI enabled)
+  NVCC_INCLUDES += -I$(MPI_HOME)/include
+  NVCC_LDFLAGS += -L$(MPI_HOME)/lib
+  NVCC_LDLIBS += -lmpi
+  NVCC_FLAGS += -DUSE_MPI
+else
+  $(info ✗ MPI not found)
+endif
+
+# cuDNN — enabled by default; cuDNN frontend headers expected in ./cudnn-frontend/include
+# Override with: make CUDNN_FRONTEND_PATH=/other/path  or  USE_CUDNN=0
+USE_CUDNN ?= 1
+ifeq ($(USE_CUDNN), 1)
+  CUDNN_FRONTEND_PATH ?= $(CURDIR)/cudnn-frontend/include
+  ifeq ($(shell [ -d $(CUDNN_FRONTEND_PATH) ] && echo "exists"), exists)
+    $(info ✓ cuDNN found, will run with flash-attention)
+    NVCC_INCLUDES += -I$(CUDNN_FRONTEND_PATH)
+    NVCC_LDFLAGS += -lcudnn
+    NVCC_FLAGS += -DENABLE_CUDNN
+    NVCC_CUDNN = $(BUILD_DIR)/cudnn_att.o
+  else
+    $(error ✗ cuDNN frontend not found at $(CUDNN_FRONTEND_PATH). Clone it or set CUDNN_FRONTEND_PATH)
+  endif
+else
+  $(info → cuDNN manually disabled, run with USE_CUDNN=1 to enable)
+endif
+
+# nvcc — provided by NVHPC module
+NVCC := $(shell which nvcc 2>/dev/null)
+
+$(info -------------------------------------------)
+
+.PHONY: all train_gpt2 test_gpt2 train_gpt2cu test_gpt2cu train_gpt2fp32cu test_gpt2fp32cu profile_gpt2cu
+
+TARGETS = train_gpt2 test_gpt2
+ifeq ($(NVCC),)
+  $(info ✗ nvcc not found, skipping GPU/CUDA builds)
+else
+  $(info ✓ nvcc found, including GPU/CUDA support)
+  TARGETS += train_gpt2cu test_gpt2cu train_gpt2fp32cu test_gpt2fp32cu $(NVCC_CUDNN)
+endif
+
+all: $(TARGETS)
+
+train_gpt2: train_gpt2.c
+	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $^ $(LDLIBS) -o $@
+
+test_gpt2: test_gpt2.c
+	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $^ $(LDLIBS) -o $@
+
+$(NVCC_CUDNN): llmc/cudnn_att.cpp
+	$(NVCC) -c $(NVCC_FLAGS) $(PFLAGS) $^ $(NVCC_INCLUDES) -o $@
+
+train_gpt2cu: train_gpt2.cu $(NVCC_CUDNN)
+	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) $^ $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS) -o $@
+
+train_gpt2fp32cu: train_gpt2_fp32.cu
+	$(NVCC) $(NVCC_FLAGS) $^ $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS) -o $@
+
+test_gpt2cu: test_gpt2.cu $(NVCC_CUDNN)
+	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) $^ $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS) -o $@
+
+test_gpt2fp32cu: test_gpt2_fp32.cu
+	$(NVCC) $(NVCC_FLAGS) $^ $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS) -o $@
+
+profile_gpt2cu: profile_gpt2.cu $(NVCC_CUDNN)
+	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) -lineinfo $^ $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS) -o $@
+
+clean:
+	rm -f $(TARGETS)
+	rm -f $(BUILD_DIR)/*.o
